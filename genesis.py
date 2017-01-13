@@ -1,27 +1,44 @@
+#!/usr/bin/env python
 import hashlib, binascii, struct, array, os, time, sys, optparse
 import scrypt
 
 from construct import *
 
+class nonceExhausted(Exception):
+  def __init__(self, value):
+    self.value = value
+  def __str__(self):
+    return repr(self.value)
 
 def main():
-  options = get_args()
+ options = get_args()
 
+ tsNonce = 0 # enable iterating nonce in timestamp message in coinbase
+ while True:
   algorithm = get_algorithm(options)
-
-  # https://en.bitcoin.it/wiki/Difficulty
-  bits, target   = get_difficulty(algorithm)
 
   input_script  = create_input_script(options.timestamp)
   output_script = create_output_script(options.pubkey)
   # hash merkle root is the double sha256 hash of the transaction(s) 
   tx = create_transaction(input_script, output_script,options)
   hash_merkle_root = hashlib.sha256(hashlib.sha256(tx).digest()).digest()
-  print_block_info(options, hash_merkle_root, bits)
+  print_block_info(options, hash_merkle_root)
 
-  block_header        = create_block_header(hash_merkle_root, options.time, bits, options.nonce)
-  genesis_hash, nonce = generate_hash(block_header, algorithm, options.nonce, target)
-  announce_found_genesis(genesis_hash, nonce)
+  block_header        = create_block_header(hash_merkle_root, options.time, options.bits, options.nonce)
+  try:
+	genesis_hash, nonce = generate_hash(block_header, algorithm, options.nonce, options.bits)
+ 	announce_found_genesis(genesis_hash, nonce)
+	sys.exit()
+  except(nonceExhausted):
+	tsNonce = tsNonce + 1
+	strHex = "%0.2X" % tsNonce # hex w/o 0x in front - only works up to 255, 256 will crash
+	options.nonce = 0
+	print( "\nNew hex timestamp:\n" + hex(tsNonce) + (options.timestamp).encode('hex') )
+	print( "\nNew string timestamp: " + ( strHex + (options.timestamp).encode('hex') ).decode('hex') )
+	# try again while loop
+  except(KeyboardInterrupt):
+	print('\n\nDetected ^C from keyboard, exit search.\n')
+	sys.exit()
 
 
 def get_args():
@@ -38,8 +55,17 @@ def get_args():
                    type="string", help="the pubkey found in the output script")
   parser.add_option("-v", "--value", dest="value", default=5000000000,
                    type="int", help="the value in coins for the output, full value (exp. in bitcoin 5000000000 - To get other coins value: Block Value * 100000000)")
+  parser.add_option("-b", "--bits", dest="bits",
+                   type="int", help="the target in compact representation, associated to a difficulty of 1")
 
   (options, args) = parser.parse_args()
+  if not options.bits:
+    if options.algorithm == "scrypt" or options.algorithm == "X11" or options.algorithm == "X13" or options.algorithm == "X15":
+      options.bits = 0x1e0ffff0
+    else:
+      options.bits = 0x1d00ffff
+  if options.nonce >= 4294967295: #gt or eq
+    parser.error("--nonce or -n have to be between 0 and 4294967294")
   return options
 
 def get_algorithm(options):
@@ -49,20 +75,13 @@ def get_algorithm(options):
   else:
     sys.exit("Error: Given algorithm must be one of: " + str(supported_algorithms))
 
-def get_difficulty(algorithm):
-  if algorithm == "scrypt":
-    return 0x1e0ffff0, 0x0ffff0 * 2**(8*(0x1e - 3))
-  elif algorithm == "SHA256":
-    return 0x1d00ffff, 0x00ffff * 2**(8*(0x1d - 3)) 
-  elif algorithm == "X11" or algorithm == "X13" or algorithm == "X15":
-    return 0x1e0ffff0, 0x0ffff0 * 2**(8*(0x1e - 3))
-
 def create_input_script(psz_timestamp):
   psz_prefix = ""
   #use OP_PUSHDATA1 if required
   if len(psz_timestamp) > 76: psz_prefix = '4c'
 
   script_prefix = '04ffff001d0104' + psz_prefix + chr(len(psz_timestamp)).encode('hex')
+  print ("\ncoinbase: ")
   print (script_prefix + psz_timestamp.encode('hex'))
   return (script_prefix + psz_timestamp.encode('hex')).decode('hex')
 
@@ -125,23 +144,26 @@ def create_block_header(hash_merkle_root, time, bits, nonce):
 
 
 # https://en.bitcoin.it/wiki/Block_hashing_algorithm
-def generate_hash(data_block, algorithm, start_nonce, target):
+def generate_hash(data_block, algorithm, start_nonce, bits):
   print 'Searching for genesis hash..'
   nonce           = start_nonce
   last_updated    = time.time()
-  difficulty      = float(0xFFFF) * 2**208 / target
-  update_interval = int(1000000 * difficulty)
+  # https://en.bitcoin.it/wiki/Difficulty
+  target = (bits & 0xffffff) * 2**(8*((bits >> 24) - 3))
 
   while True:
     sha256_hash, header_hash = generate_hashes_from_block(data_block, algorithm)
-    last_updated             = calculate_hashrate(nonce, update_interval, difficulty, last_updated)
+    last_updated             = calculate_hashrate(nonce, last_updated)
     if is_genesis_hash(header_hash, target):
       if algorithm == "X11" or algorithm == "X13" or algorithm == "X15":
         return (header_hash, nonce)
       return (sha256_hash, nonce)
     else:
-     nonce      = nonce + 1
-     data_block = data_block[0:len(data_block) - 4] + struct.pack('<I', nonce)  
+      if nonce >= 4294967295: # if greater than, crash at 4294967297 0x0001 0000 0001
+	raise MyError(1)
+      else:
+       nonce      = nonce + 1
+       data_block = data_block[0:len(data_block) - 4] + struct.pack('<I', nonce)
 
 
 def generate_hashes_from_block(data_block, algorithm):
@@ -176,31 +198,34 @@ def is_genesis_hash(header_hash, target):
   return int(header_hash.encode('hex_codec'), 16) < target
 
 
-def calculate_hashrate(nonce, update_interval, difficulty, last_updated):
-  if nonce % update_interval == update_interval - 1:
+def calculate_hashrate(nonce, last_updated):
+  if nonce % 1000000 == 999999:
     now             = time.time()
-    hashrate        = round(update_interval/(now - last_updated))
-    generation_time = round(difficulty * pow(2, 32) / hashrate / 3600, 1)
-    sys.stdout.write("\r%s hash/s, estimate: %s h"%(str(hashrate), str(generation_time)))
+    hashrate        = round(1000000/(now - last_updated))
+    generation_time = round(pow(2, 32) / hashrate / 3600, 1)
+    sys.stdout.write("\r%s hash/s, estimate: %s h - last nonce: %s "%(str(hashrate), str(generation_time), str(nonce)) )
     sys.stdout.flush()
     return now
   else:
     return last_updated
+    # save cpu cycles
 
 
-def print_block_info(options, hash_merkle_root, bits):
+def print_block_info(options, hash_merkle_root):
   print "algorithm: "    + (options.algorithm)
   print "merkle hash: "  + hash_merkle_root[::-1].encode('hex_codec')
   print "pszTimestamp: " + options.timestamp
   print "pubkey: "       + options.pubkey
   print "time: "         + str(options.time)
-  print "bits: "         + str(hex(bits))
+  print "bits: "         + str(hex(options.bits))
 
 
 def announce_found_genesis(genesis_hash, nonce):
+  print "\n"
   print "genesis hash found!"
   print "nonce: "        + str(nonce)
   print "genesis hash: " + genesis_hash.encode('hex_codec')
+  print "\n"
 
 
 # GOGOGO!
